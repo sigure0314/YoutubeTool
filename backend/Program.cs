@@ -18,7 +18,14 @@ builder.Services.Configure<YoutubeApiOptions>(builder.Configuration.GetSection("
 builder.Services.AddHttpClient<IYoutubeCommentService, YoutubeCommentService>((sp, client) =>
 {
     var options = sp.GetRequiredService<IOptions<YoutubeApiOptions>>();
-    client.BaseAddress = new Uri(options.Value.BaseUrl);
+    var baseUrl = options.Value.BaseUrl?.TrimEnd('/') ?? string.Empty;
+
+    if (string.IsNullOrWhiteSpace(baseUrl))
+    {
+        throw new InvalidOperationException("YouTube API base URL is not configured.");
+    }
+
+    client.BaseAddress = new Uri($"{baseUrl}/", UriKind.Absolute);
 });
 
 builder.Services.AddScoped<IApiRequestLogger, ApiRequestLogger>();
