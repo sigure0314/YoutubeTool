@@ -1,25 +1,35 @@
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
+using YoutubeTool.Api.Data;
 using YoutubeTool.Api.Dtos;
+using YoutubeTool.Api.Models;
 using YoutubeTool.Api.Options;
 
 namespace YoutubeTool.Api.Services;
 
 public class YoutubeCommentService : IYoutubeCommentService
 {
-    private const int PageSize = 40;
+    private const int PageSize = 100;
 
     private readonly HttpClient _httpClient;
     private readonly YoutubeApiOptions _options;
     private readonly ILogger<YoutubeCommentService> _logger;
+    private readonly ApplicationDbContext _dbContext;
 
-    public YoutubeCommentService(HttpClient httpClient, IOptions<YoutubeApiOptions> options, ILogger<YoutubeCommentService> logger)
+    public YoutubeCommentService(
+        HttpClient httpClient,
+        IOptions<YoutubeApiOptions> options,
+        ILogger<YoutubeCommentService> logger,
+        ApplicationDbContext dbContext)
     {
         _httpClient = httpClient;
         _options = options.Value;
         _logger = logger;
+        _dbContext = dbContext;
     }
 
     public async Task<YoutubeCommentsResponse> GetTopLevelCommentsAsync(string videoId, int page, CancellationToken cancellationToken = default)
@@ -36,91 +46,10 @@ public class YoutubeCommentService : IYoutubeCommentService
 
         var normalizedPage = Math.Max(1, page);
 
-        var uniqueComments = new List<YoutubeCommentDto>();
-        var seenAuthors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var comments = await FetchAllCommentsFromApiAsync(videoId, cancellationToken);
+        await PersistCommentsAsync(videoId, comments, cancellationToken);
 
-        string? nextPageToken = null;
-        bool lastResponseHadMore = false;
-
-        do
-        {
-            var requestUrl = BuildRequestUrl(videoId, nextPageToken);
-
-            HttpResponseMessage response;
-            try
-            {
-                response = await _httpClient.GetAsync(requestUrl, cancellationToken);
-            }
-            catch (HttpRequestException ex)
-            {
-                _logger.LogError(ex, "YouTube API request could not be completed.");
-                throw new InvalidOperationException("YouTube API request could not be completed.", ex);
-            }
-
-            using (response)
-            {
-                if (!response.IsSuccessStatusCode)
-                {
-                    var error = await response.Content.ReadAsStringAsync(cancellationToken);
-                    _logger.LogError("YouTube API request failed with {StatusCode}: {Error}", response.StatusCode, error);
-                    throw new InvalidOperationException($"YouTube API request failed with status code {response.StatusCode}.");
-                }
-
-                using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-
-                if (document.RootElement.TryGetProperty("items", out var itemsElement))
-                {
-                    foreach (var item in itemsElement.EnumerateArray())
-                    {
-                        if (!item.TryGetProperty("snippet", out var snippetElement) ||
-                            !snippetElement.TryGetProperty("topLevelComment", out var topLevelCommentElement) ||
-                            !topLevelCommentElement.TryGetProperty("snippet", out var commentSnippet))
-                        {
-                            continue;
-                        }
-
-                        var authorChannelId = ExtractAuthorChannelId(commentSnippet);
-                        var authorKey = authorChannelId ?? commentSnippet.GetProperty("authorDisplayName").GetString() ?? string.Empty;
-
-                        if (string.IsNullOrEmpty(authorKey) || !seenAuthors.Add(authorKey))
-                        {
-                            continue;
-                        }
-
-                        var authorDisplayName = commentSnippet.GetProperty("authorDisplayName").GetString() ?? "Unknown";
-                        var authorChannelUrl = ExtractAuthorChannelUrl(commentSnippet, authorChannelId);
-                        var publishedAt = commentSnippet.TryGetProperty("publishedAt", out var publishedElement)
-                            ? publishedElement.GetDateTime()
-                            : DateTime.UtcNow;
-
-                        var text = commentSnippet.TryGetProperty("textDisplay", out var textElement)
-                            ? textElement.GetString() ?? string.Empty
-                            : string.Empty;
-
-                        var sanitizedText = SanitizeComment(text);
-
-                        uniqueComments.Add(new YoutubeCommentDto(
-                            authorDisplayName,
-                            authorChannelUrl,
-                            Truncate(sanitizedText, 50),
-                            publishedAt.ToUniversalTime()));
-                    }
-                }
-
-                nextPageToken = document.RootElement.TryGetProperty("nextPageToken", out var tokenElement)
-                    ? tokenElement.GetString()
-                    : null;
-
-                lastResponseHadMore = !string.IsNullOrEmpty(nextPageToken);
-            }
-        }
-        while (uniqueComments.Count < normalizedPage * PageSize && !string.IsNullOrEmpty(nextPageToken));
-
-        var skip = (normalizedPage - 1) * PageSize;
-        var pageComments = uniqueComments.Skip(skip).Take(PageSize).ToList();
-
-        var hasMore = uniqueComments.Count > normalizedPage * PageSize || lastResponseHadMore;
+        var (pageComments, hasMore) = await LoadPageFromDatabaseAsync(videoId, normalizedPage, cancellationToken);
 
         return new YoutubeCommentsResponse
         {
@@ -130,6 +59,177 @@ public class YoutubeCommentService : IYoutubeCommentService
             HasMore = hasMore,
             Comments = pageComments
         };
+    }
+
+    private async Task<(IReadOnlyCollection<YoutubeCommentDto> Comments, bool HasMore)> LoadPageFromDatabaseAsync(
+        string videoId,
+        int page,
+        CancellationToken cancellationToken)
+    {
+        var skip = (page - 1) * PageSize;
+        var seenAuthors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var currentPage = new List<YoutubeCommentDto>();
+        var uniqueCount = 0;
+        var hasMore = false;
+
+        await foreach (var comment in _dbContext.YoutubeComments
+            .AsNoTracking()
+            .Where(c => c.VideoId == videoId)
+            .OrderByDescending(c => c.PublishedAt)
+            .AsAsyncEnumerable()
+            .WithCancellation(cancellationToken))
+        {
+            var authorKey = comment.AuthorChannelId ?? comment.AuthorDisplayName;
+            if (string.IsNullOrWhiteSpace(authorKey) || !seenAuthors.Add(authorKey))
+            {
+                continue;
+            }
+
+            uniqueCount++;
+
+            if (uniqueCount <= skip)
+            {
+                continue;
+            }
+
+            if (currentPage.Count < PageSize)
+            {
+                currentPage.Add(new YoutubeCommentDto(
+                    comment.AuthorDisplayName,
+                    comment.AuthorChannelUrl,
+                    Truncate(comment.CommentText, 50),
+                    EnsureUtc(comment.PublishedAt)));
+                continue;
+            }
+
+            hasMore = true;
+            break;
+        }
+
+        return (currentPage, hasMore);
+    }
+
+    private async Task PersistCommentsAsync(string videoId, List<YoutubeComment> comments, CancellationToken cancellationToken)
+    {
+        await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        await _dbContext.YoutubeComments
+            .Where(c => c.VideoId == videoId)
+            .ExecuteDeleteAsync(cancellationToken);
+
+        if (comments.Count > 0)
+        {
+            await _dbContext.YoutubeComments.AddRangeAsync(comments, cancellationToken);
+            await _dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private async Task<List<YoutubeComment>> FetchAllCommentsFromApiAsync(string videoId, CancellationToken cancellationToken)
+    {
+        var collectedComments = new List<YoutubeComment>();
+        string? nextPageToken = null;
+        var retrievalTime = DateTime.UtcNow;
+
+        do
+        {
+            var (pageComments, token) = await FetchCommentsPageAsync(videoId, nextPageToken, retrievalTime, cancellationToken);
+            collectedComments.AddRange(pageComments);
+            nextPageToken = token;
+        }
+        while (!string.IsNullOrEmpty(nextPageToken));
+
+        return collectedComments;
+    }
+
+    private async Task<(List<YoutubeComment> Comments, string? NextPageToken)> FetchCommentsPageAsync(
+        string videoId,
+        string? pageToken,
+        DateTime retrievalTime,
+        CancellationToken cancellationToken)
+    {
+        var requestUrl = BuildRequestUrl(videoId, pageToken);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await _httpClient.GetAsync(requestUrl, cancellationToken);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError(ex, "YouTube API request could not be completed.");
+            throw new InvalidOperationException("YouTube API request could not be completed.", ex);
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync(cancellationToken);
+                _logger.LogError("YouTube API request failed with {StatusCode}: {Error}", response.StatusCode, error);
+                throw new InvalidOperationException($"YouTube API request failed with status code {response.StatusCode}.");
+            }
+
+            using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+
+            var comments = new List<YoutubeComment>();
+
+            if (document.RootElement.TryGetProperty("items", out var itemsElement))
+            {
+                foreach (var item in itemsElement.EnumerateArray())
+                {
+                    if (!item.TryGetProperty("snippet", out var snippetElement) ||
+                        !snippetElement.TryGetProperty("topLevelComment", out var topLevelCommentElement) ||
+                        !topLevelCommentElement.TryGetProperty("snippet", out var commentSnippet))
+                    {
+                        continue;
+                    }
+
+                    var commentId = topLevelCommentElement.TryGetProperty("id", out var commentIdElement)
+                        ? commentIdElement.GetString()
+                        : null;
+
+                    if (string.IsNullOrWhiteSpace(commentId))
+                    {
+                        commentId = Guid.NewGuid().ToString("N");
+                    }
+
+                    var authorChannelId = ExtractAuthorChannelId(commentSnippet);
+                    var authorDisplayName = commentSnippet.GetProperty("authorDisplayName").GetString() ?? "Unknown";
+                    var authorChannelUrl = ExtractAuthorChannelUrl(commentSnippet, authorChannelId);
+
+                    var text = commentSnippet.TryGetProperty("textDisplay", out var textElement)
+                        ? textElement.GetString() ?? string.Empty
+                        : string.Empty;
+
+                    var sanitizedText = SanitizeComment(text);
+
+                    var publishedAtRaw = commentSnippet.TryGetProperty("publishedAt", out var publishedElement)
+                        ? publishedElement.GetDateTime()
+                        : DateTime.UtcNow;
+
+                    comments.Add(new YoutubeComment
+                    {
+                        VideoId = videoId,
+                        CommentId = commentId,
+                        AuthorChannelId = authorChannelId,
+                        AuthorDisplayName = authorDisplayName,
+                        AuthorChannelUrl = authorChannelUrl,
+                        CommentText = sanitizedText,
+                        PublishedAt = EnsureUtc(publishedAtRaw),
+                        RetrievedAt = retrievalTime
+                    });
+                }
+            }
+
+            var nextPageToken = document.RootElement.TryGetProperty("nextPageToken", out var tokenElement)
+                ? tokenElement.GetString()
+                : null;
+
+            return (comments, nextPageToken);
+        }
     }
 
     private string BuildRequestUrl(string videoId, string? pageToken)
@@ -195,5 +295,15 @@ public class YoutubeCommentService : IYoutubeCommentService
         }
 
         return value[..maxLength];
+    }
+
+    private static DateTime EnsureUtc(DateTime value)
+    {
+        return value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+        };
     }
 }
