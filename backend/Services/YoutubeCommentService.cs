@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
@@ -19,6 +20,8 @@ public class YoutubeCommentService : IYoutubeCommentService
     private readonly YoutubeApiOptions _options;
     private readonly ILogger<YoutubeCommentService> _logger;
     private readonly ApplicationDbContext _dbContext;
+    private static readonly SemaphoreSlim InitializationSemaphore = new(1, 1);
+    private static bool _isDatabaseInitialized;
 
     public YoutubeCommentService(
         HttpClient httpClient,
@@ -43,6 +46,8 @@ public class YoutubeCommentService : IYoutubeCommentService
         {
             throw new InvalidOperationException("YouTube API key is not configured.");
         }
+
+        await EnsureDatabaseReadyAsync(cancellationToken);
 
         var normalizedPage = Math.Max(1, page);
 
@@ -107,6 +112,31 @@ public class YoutubeCommentService : IYoutubeCommentService
         }
 
         return (currentPage, hasMore);
+    }
+
+    private async Task EnsureDatabaseReadyAsync(CancellationToken cancellationToken)
+    {
+        if (_isDatabaseInitialized)
+        {
+            return;
+        }
+
+        await InitializationSemaphore.WaitAsync(cancellationToken);
+
+        try
+        {
+            if (_isDatabaseInitialized)
+            {
+                return;
+            }
+
+            await _dbContext.Database.MigrateAsync(cancellationToken);
+            _isDatabaseInitialized = true;
+        }
+        finally
+        {
+            InitializationSemaphore.Release();
+        }
     }
 
     private async Task PersistCommentsAsync(string videoId, List<YoutubeComment> comments, CancellationToken cancellationToken)
