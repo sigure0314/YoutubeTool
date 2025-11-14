@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -21,6 +22,7 @@ public class YoutubeCommentService : IYoutubeCommentService
     private readonly ILogger<YoutubeCommentService> _logger;
     private readonly ApplicationDbContext _dbContext;
     private static readonly SemaphoreSlim InitializationSemaphore = new(1, 1);
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> VideoLocks = new(StringComparer.OrdinalIgnoreCase);
     private static bool _isDatabaseInitialized;
 
     public YoutubeCommentService(
@@ -141,19 +143,59 @@ public class YoutubeCommentService : IYoutubeCommentService
 
     private async Task PersistCommentsAsync(string videoId, List<YoutubeComment> comments, CancellationToken cancellationToken)
     {
-        await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+        var videoLock = VideoLocks.GetOrAdd(videoId, _ => new SemaphoreSlim(1, 1));
+        await videoLock.WaitAsync(cancellationToken);
 
-        await _dbContext.YoutubeComments
-            .Where(c => c.VideoId == videoId)
-            .ExecuteDeleteAsync(cancellationToken);
-
-        if (comments.Count > 0)
+        try
         {
-            await _dbContext.YoutubeComments.AddRangeAsync(comments, cancellationToken);
-            await _dbContext.SaveChangesAsync(cancellationToken);
+            await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+            await _dbContext.YoutubeComments
+                .Where(c => c.VideoId == videoId)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            var uniqueComments = DeduplicateComments(comments);
+
+            if (uniqueComments.Count > 0)
+            {
+                await _dbContext.YoutubeComments.AddRangeAsync(uniqueComments, cancellationToken);
+                await _dbContext.SaveChangesAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            videoLock.Release();
+
+            if (videoLock.CurrentCount == 1)
+            {
+                VideoLocks.TryRemove(videoId, out _);
+            }
+        }
+    }
+
+    private static List<YoutubeComment> DeduplicateComments(IEnumerable<YoutubeComment> comments)
+    {
+        var uniqueComments = new Dictionary<(string VideoId, string CommentId), YoutubeComment>();
+
+        foreach (var comment in comments)
+        {
+            var key = (comment.VideoId, comment.CommentId);
+
+            if (!uniqueComments.TryGetValue(key, out var existing))
+            {
+                uniqueComments[key] = comment;
+                continue;
+            }
+
+            if (comment.PublishedAt > existing.PublishedAt)
+            {
+                uniqueComments[key] = comment;
+            }
         }
 
-        await transaction.CommitAsync(cancellationToken);
+        return uniqueComments.Values.ToList();
     }
 
     private async Task<List<YoutubeComment>> FetchAllCommentsFromApiAsync(string videoId, CancellationToken cancellationToken)
