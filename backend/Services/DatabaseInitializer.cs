@@ -1,6 +1,8 @@
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using YoutubeTool.Api.Data;
@@ -83,31 +85,75 @@ public class DatabaseInitializer : IDatabaseInitializer, IAsyncDisposable
 
         for (var attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            try
-            {
-                foreach (var table in RequiredTables)
-                {
-                    var command = $"SELECT 1 FROM \"{table}\" LIMIT 1;";
-                    await context.Database.ExecuteSqlRawAsync(command, cancellationToken);
-                }
+            var missingTables = await GetMissingTablesAsync(context, cancellationToken);
 
+            if (missingTables.Count == 0)
+            {
                 return;
             }
-            catch (SqliteException ex) when (IsMissingTableException(ex) && attempt < maxAttempts)
+
+            if (attempt < maxAttempts)
             {
-                _logger.LogWarning(ex, "Detected missing SQLite tables. Recreating the database file to restore the schema.");
+                _logger.LogWarning(
+                    "Detected missing SQLite tables ({MissingTables}). Recreating the database file to restore the schema.",
+                    string.Join(", ", missingTables));
 
                 await context.Database.EnsureDeletedAsync(cancellationToken);
                 await context.Database.MigrateAsync(cancellationToken);
+
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"Database schema validation failed after attempting to recreate the SQLite database. Missing tables: {string.Join(", ", missingTables)}");
+        }
+    }
+
+    private static async Task<IReadOnlyList<string>> GetMissingTablesAsync(ApplicationDbContext context, CancellationToken cancellationToken)
+    {
+        var missingTables = new List<string>();
+        var connection = context.Database.GetDbConnection();
+        var shouldCloseConnection = connection.State != ConnectionState.Open;
+
+        if (shouldCloseConnection)
+        {
+            await connection.OpenAsync(cancellationToken);
+        }
+
+        try
+        {
+            foreach (var table in RequiredTables)
+            {
+                await using var command = CreateTableLookupCommand(connection, table);
+                var result = await command.ExecuteScalarAsync(cancellationToken);
+
+                if (result is null || result == DBNull.Value)
+                {
+                    missingTables.Add(table);
+                }
+            }
+        }
+        finally
+        {
+            if (shouldCloseConnection)
+            {
+                await connection.CloseAsync();
             }
         }
 
-        throw new InvalidOperationException("Database schema validation failed after attempting to recreate the SQLite database.");
+        return missingTables;
     }
 
-    private static bool IsMissingTableException(SqliteException exception)
+    private static DbCommand CreateTableLookupCommand(DbConnection connection, string tableName)
     {
-        return exception.SqliteErrorCode == 1 &&
-               exception.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase);
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' AND name = $tableName;";
+
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "$tableName";
+        parameter.Value = tableName;
+        command.Parameters.Add(parameter);
+
+        return command;
     }
 }
