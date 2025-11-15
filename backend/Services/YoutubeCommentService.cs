@@ -140,7 +140,7 @@ public class YoutubeCommentService : IYoutubeCommentService
 
     private async Task EnsureDatabaseReadyAsync(CancellationToken cancellationToken)
     {
-        if (_isDatabaseInitialized)
+        if (_isDatabaseInitialized && await IsSchemaReadyAsync(cancellationToken))
         {
             return;
         }
@@ -149,7 +149,7 @@ public class YoutubeCommentService : IYoutubeCommentService
 
         try
         {
-            if (_isDatabaseInitialized)
+            if (_isDatabaseInitialized && await IsSchemaReadyAsync(cancellationToken))
             {
                 return;
             }
@@ -160,6 +160,39 @@ public class YoutubeCommentService : IYoutubeCommentService
         finally
         {
             InitializationSemaphore.Release();
+        }
+    }
+
+    private async Task<bool> IsSchemaReadyAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var tableName = _dbContext.Model
+                .FindEntityType(typeof(YoutubeComment))?
+                .GetTableName() ?? "YoutubeComments";
+
+            var connectionString = _dbContext.Database.GetConnectionString();
+
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                return false;
+            }
+
+            await using var connection = new SqliteConnection(connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $table LIMIT 1;";
+            command.Parameters.AddWithValue("$table", tableName);
+
+            var result = await command.ExecuteScalarAsync(cancellationToken);
+
+            return result is not null;
+        }
+        catch (SqliteException ex)
+        {
+            _logger.LogWarning(ex, "Failed to verify database schema state.");
+            return false;
         }
     }
 
