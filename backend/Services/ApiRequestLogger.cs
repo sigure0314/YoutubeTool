@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using YoutubeTool.Api.Data;
 using YoutubeTool.Api.Models;
 
@@ -5,11 +6,11 @@ namespace YoutubeTool.Api.Services;
 
 public class ApiRequestLogger : IApiRequestLogger
 {
-    private readonly ApplicationDbContext _context;
+    private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
 
-    public ApiRequestLogger(ApplicationDbContext context)
+    public ApiRequestLogger(IDbContextFactory<ApplicationDbContext> dbContextFactory)
     {
-        _context = context;
+        _dbContextFactory = dbContextFactory;
     }
 
     public async Task LogRequestAsync(string videoId, int page, int returnedCount, string? requestIp, CancellationToken cancellationToken = default)
@@ -23,7 +24,9 @@ public class ApiRequestLogger : IApiRequestLogger
             RequestIp = requestIp
         };
 
-        _context.ApiRequestLogs.Add(entry);
-        await _context.SaveChangesAsync(cancellationToken);
+        await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+
+        context.ApiRequestLogs.Add(entry);
+        await context.SaveChangesAsync(cancellationToken);
     }
 }
