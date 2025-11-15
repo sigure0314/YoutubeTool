@@ -1,7 +1,4 @@
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
-using YoutubeTool.Api.Data;
 using YoutubeTool.Api.Options;
 using YoutubeTool.Api.Services;
 
@@ -10,18 +7,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
-
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-
-if (string.IsNullOrWhiteSpace(connectionString))
-{
-    throw new InvalidOperationException("Default SQLite connection string is not configured.");
-}
-
-builder.Services.AddDbContextFactory<ApplicationDbContext>(options =>
-    options.UseSqlite(connectionString));
-
-builder.Services.AddSingleton<IDatabaseInitializer, DatabaseInitializer>();
 
 builder.Services.Configure<YoutubeApiOptions>(builder.Configuration.GetSection("YoutubeApi"));
 
@@ -38,7 +23,7 @@ builder.Services.AddHttpClient<IYoutubeCommentService, YoutubeCommentService>((s
     client.BaseAddress = new Uri($"{baseUrl}/", UriKind.Absolute);
 });
 
-builder.Services.AddScoped<IApiRequestLogger, ApiRequestLogger>();
+builder.Services.AddSingleton<IApiRequestLogger, ApiRequestLogger>();
 
 var allowedOrigins = builder.Configuration.GetSection("AllowedOrigins").Get<string[]>() ?? [];
 
@@ -62,12 +47,6 @@ builder.Services.AddCors(options =>
 });
 
 var app = builder.Build();
-
-await using (var scope = app.Services.CreateAsyncScope())
-{
-    var initializer = scope.ServiceProvider.GetRequiredService<IDatabaseInitializer>();
-    await initializer.EnsureCreatedAsync();
-}
 
 if (app.Environment.IsDevelopment())
 {

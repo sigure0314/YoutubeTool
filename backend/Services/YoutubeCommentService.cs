@@ -1,12 +1,9 @@
-using System.Collections.Concurrent;
+using System.Linq;
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
-using Microsoft.Data.Sqlite;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
-using YoutubeTool.Api.Data;
 using YoutubeTool.Api.Dtos;
 using YoutubeTool.Api.Models;
 using YoutubeTool.Api.Options;
@@ -20,22 +17,15 @@ public class YoutubeCommentService : IYoutubeCommentService
     private readonly HttpClient _httpClient;
     private readonly YoutubeApiOptions _options;
     private readonly ILogger<YoutubeCommentService> _logger;
-    private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
-    private readonly IDatabaseInitializer _databaseInitializer;
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> VideoLocks = new(StringComparer.OrdinalIgnoreCase);
 
     public YoutubeCommentService(
         HttpClient httpClient,
         IOptions<YoutubeApiOptions> options,
-        ILogger<YoutubeCommentService> logger,
-        IDbContextFactory<ApplicationDbContext> dbContextFactory,
-        IDatabaseInitializer databaseInitializer)
+        ILogger<YoutubeCommentService> logger)
     {
         _httpClient = httpClient;
         _options = options.Value;
         _logger = logger;
-        _dbContextFactory = dbContextFactory;
-        _databaseInitializer = databaseInitializer;
     }
 
     public async Task<YoutubeCommentsResponse> GetTopLevelCommentsAsync(string videoId, int page, CancellationToken cancellationToken = default)
@@ -50,35 +40,19 @@ public class YoutubeCommentService : IYoutubeCommentService
             throw new InvalidOperationException("YouTube API key is not configured.");
         }
 
-        await EnsureDatabaseReadyAsync(cancellationToken);
-
         var normalizedPage = Math.Max(1, page);
 
         var comments = await FetchAllCommentsFromApiAsync(videoId, cancellationToken);
 
-        try
-        {
-            return await BuildResponseAsync(videoId, normalizedPage, comments, cancellationToken);
-        }
-        catch (SqliteException ex) when (IsMissingTableException(ex))
-        {
-            _logger.LogWarning(ex, "Database schema is missing. Re-applying migrations and retrying the request.");
-
-            _databaseInitializer.Reset();
-            await EnsureDatabaseReadyAsync(cancellationToken);
-
-            return await BuildResponseAsync(videoId, normalizedPage, comments, cancellationToken);
-        }
+        return BuildResponse(videoId, normalizedPage, comments);
     }
 
-    private async Task<YoutubeCommentsResponse> BuildResponseAsync(
+    private YoutubeCommentsResponse BuildResponse(
         string videoId,
         int page,
-        List<YoutubeComment> comments,
-        CancellationToken cancellationToken)
+        List<YoutubeComment> comments)
     {
-        await PersistCommentsAsync(videoId, comments, cancellationToken);
-        var (pageComments, hasMore) = await LoadPageFromDatabaseAsync(videoId, page, cancellationToken);
+        var (pageComments, hasMore) = BuildPage(videoId, page, comments);
 
         return new YoutubeCommentsResponse
         {
@@ -90,10 +64,10 @@ public class YoutubeCommentService : IYoutubeCommentService
         };
     }
 
-    private async Task<(IReadOnlyCollection<YoutubeCommentDto> Comments, bool HasMore)> LoadPageFromDatabaseAsync(
+    private (IReadOnlyCollection<YoutubeCommentDto> Comments, bool HasMore) BuildPage(
         string videoId,
         int page,
-        CancellationToken cancellationToken)
+        List<YoutubeComment> comments)
     {
         var skip = (page - 1) * PageSize;
         var seenAuthors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -101,14 +75,12 @@ public class YoutubeCommentService : IYoutubeCommentService
         var uniqueCount = 0;
         var hasMore = false;
 
-        await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
-
-        await foreach (var comment in context.YoutubeComments
-            .AsNoTracking()
+        var deduplicated = DeduplicateComments(comments)
             .Where(c => c.VideoId == videoId)
             .OrderByDescending(c => c.PublishedAt)
-            .AsAsyncEnumerable()
-            .WithCancellation(cancellationToken))
+            .ThenBy(c => c.CommentId, StringComparer.Ordinal);
+
+        foreach (var comment in deduplicated)
         {
             var authorKey = comment.AuthorChannelId ?? comment.AuthorDisplayName;
             if (string.IsNullOrWhiteSpace(authorKey) || !seenAuthors.Add(authorKey))
@@ -140,49 +112,6 @@ public class YoutubeCommentService : IYoutubeCommentService
         return (currentPage, hasMore);
     }
 
-    private async Task EnsureDatabaseReadyAsync(CancellationToken cancellationToken)
-    {
-        await _databaseInitializer.EnsureCreatedAsync(cancellationToken);
-    }
-
-    private async Task PersistCommentsAsync(string videoId, List<YoutubeComment> comments, CancellationToken cancellationToken)
-    {
-        var videoLock = VideoLocks.GetOrAdd(videoId, _ => new SemaphoreSlim(1, 1));
-        await videoLock.WaitAsync(cancellationToken);
-
-        try
-        {
-            var uniqueComments = DeduplicateComments(comments);
-
-            await ExecuteWithRetryAsync(async retryCancellationToken =>
-            {
-                await using var context = await _dbContextFactory.CreateDbContextAsync(retryCancellationToken);
-                await using var transaction = await context.Database.BeginTransactionAsync(retryCancellationToken);
-
-                await context.YoutubeComments
-                    .Where(c => c.VideoId == videoId)
-                    .ExecuteDeleteAsync(retryCancellationToken);
-
-                if (uniqueComments.Count > 0)
-                {
-                    await context.YoutubeComments.AddRangeAsync(uniqueComments, retryCancellationToken);
-                    await context.SaveChangesAsync(retryCancellationToken);
-                }
-
-                await transaction.CommitAsync(retryCancellationToken);
-            }, cancellationToken);
-        }
-        finally
-        {
-            videoLock.Release();
-
-            if (videoLock.CurrentCount == 1)
-            {
-                VideoLocks.TryRemove(videoId, out _);
-            }
-        }
-    }
-
     private static List<YoutubeComment> DeduplicateComments(IEnumerable<YoutubeComment> comments)
     {
         var uniqueComments = new Dictionary<(string VideoId, string CommentId), YoutubeComment>();
@@ -204,67 +133,6 @@ public class YoutubeCommentService : IYoutubeCommentService
         }
 
         return uniqueComments.Values.ToList();
-    }
-
-    private async Task ExecuteWithRetryAsync(Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
-    {
-        var delays = new[]
-        {
-            TimeSpan.Zero,
-            TimeSpan.FromMilliseconds(100),
-            TimeSpan.FromMilliseconds(250),
-            TimeSpan.FromMilliseconds(500)
-        };
-
-        Exception? lastException = null;
-
-        foreach (var delay in delays)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay, cancellationToken);
-            }
-
-            try
-            {
-                await operation(cancellationToken);
-                return;
-            }
-            catch (SqliteException ex) when (IsTransientSqliteException(ex))
-            {
-                lastException = ex;
-                _logger.LogWarning(ex, "Transient SQLite error while persisting comments. Retrying...");
-            }
-            catch (SqliteException ex) when (IsMissingTableException(ex))
-            {
-                lastException = ex;
-                _logger.LogWarning(ex, "Missing database table detected while persisting comments. Attempting to re-apply migrations.");
-
-                _databaseInitializer.Reset();
-
-                await EnsureDatabaseReadyAsync(cancellationToken);
-            }
-        }
-
-        if (lastException is not null)
-        {
-            throw lastException;
-        }
-
-        throw new InvalidOperationException("The retry operation completed without executing.");
-    }
-
-    private static bool IsTransientSqliteException(SqliteException exception)
-    {
-        return exception.SqliteErrorCode is 5 or 6 or 262;
-    }
-
-    private static bool IsMissingTableException(SqliteException exception)
-    {
-        return exception.SqliteErrorCode == 1 &&
-               exception.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<List<YoutubeComment>> FetchAllCommentsFromApiAsync(string videoId, CancellationToken cancellationToken)
