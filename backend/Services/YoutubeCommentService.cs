@@ -3,6 +3,7 @@ using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
@@ -148,21 +149,24 @@ public class YoutubeCommentService : IYoutubeCommentService
 
         try
         {
-            await using var transaction = await _dbContext.Database.BeginTransactionAsync(cancellationToken);
-
-            await _dbContext.YoutubeComments
-                .Where(c => c.VideoId == videoId)
-                .ExecuteDeleteAsync(cancellationToken);
-
-            var uniqueComments = DeduplicateComments(comments);
-
-            if (uniqueComments.Count > 0)
+            await ExecuteWithRetryAsync(async retryCancellationToken =>
             {
-                await _dbContext.YoutubeComments.AddRangeAsync(uniqueComments, cancellationToken);
-                await _dbContext.SaveChangesAsync(cancellationToken);
-            }
+                await using var transaction = await _dbContext.Database.BeginTransactionAsync(retryCancellationToken);
 
-            await transaction.CommitAsync(cancellationToken);
+                await _dbContext.YoutubeComments
+                    .Where(c => c.VideoId == videoId)
+                    .ExecuteDeleteAsync(retryCancellationToken);
+
+                var uniqueComments = DeduplicateComments(comments);
+
+                if (uniqueComments.Count > 0)
+                {
+                    await _dbContext.YoutubeComments.AddRangeAsync(uniqueComments, retryCancellationToken);
+                    await _dbContext.SaveChangesAsync(retryCancellationToken);
+                }
+
+                await transaction.CommitAsync(retryCancellationToken);
+            }, cancellationToken);
         }
         finally
         {
@@ -196,6 +200,53 @@ public class YoutubeCommentService : IYoutubeCommentService
         }
 
         return uniqueComments.Values.ToList();
+    }
+
+    private async Task ExecuteWithRetryAsync(Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+    {
+        var delays = new[]
+        {
+            TimeSpan.Zero,
+            TimeSpan.FromMilliseconds(100),
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromMilliseconds(500)
+        };
+
+        Exception? lastException = null;
+
+        foreach (var delay in delays)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+
+            try
+            {
+                await operation(cancellationToken);
+                return;
+            }
+            catch (SqliteException ex) when (IsTransientSqliteException(ex))
+            {
+                lastException = ex;
+                _logger.LogWarning(ex, "Transient SQLite error while persisting comments. Retrying...");
+                _dbContext.ChangeTracker.Clear();
+            }
+        }
+
+        if (lastException is not null)
+        {
+            throw lastException;
+        }
+
+        throw new InvalidOperationException("The retry operation completed without executing.");
+    }
+
+    private static bool IsTransientSqliteException(SqliteException exception)
+    {
+        return exception.SqliteErrorCode is 5 or 6 or 262;
     }
 
     private async Task<List<YoutubeComment>> FetchAllCommentsFromApiAsync(string videoId, CancellationToken cancellationToken)
