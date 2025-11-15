@@ -1,66 +1,27 @@
 .youtube-tool {
+  width: 100%;
+  max-width: 960px;
   display: flex;
   flex-direction: column;
   gap: 1.5rem;
-  max-width: 960px;
+}
+
+.youtube-tool__header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
 
 .youtube-tool__header h2 {
   margin: 0;
   font-size: 1.5rem;
+  color: #111827;
 }
 
-.youtube-tool__header p {
-  margin: 0.5rem 0 0;
+.youtube-tool__video-id {
+  margin: 0;
   color: #4b5563;
-}
-
-.youtube-tool__form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.youtube-tool__input-group {
-  display: flex;
-  gap: 0.75rem;
-}
-
-.youtube-tool__input-group input {
-  flex: 1;
-  padding: 0.75rem;
-  border: 1px solid #d1d5db;
-  border-radius: 0.5rem;
-}
-
-.youtube-tool__input-group button {
-  padding: 0 1.5rem;
-  border-radius: 0.5rem;
-  border: none;
-  background-color: #2563eb;
-  color: #fff;
-  cursor: pointer;
-  transition: background-color 0.2s ease;
-}
-
-.youtube-tool__input-group button:disabled {
-  cursor: not-allowed;
-  opacity: 0.7;
-}
-
-.youtube-tool__input-group button:not(:disabled):hover {
-  background-color: #1d4ed8;
-}
-
-.youtube-tool__error {
-  padding: 0.75rem 1rem;
-  border-radius: 0.5rem;
-  background-color: #fee2e2;
-  color: #b91c1c;
-}
-
-.youtube-tool__summary {
-  font-weight: 600;
+  font-size: 0.95rem;
 }
 
 .youtube-tool__results {
@@ -73,6 +34,13 @@
   color: #6b7280;
   background-color: #f9fafb;
   border-radius: 0.5rem;
+}
+
+.youtube-tool__error {
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  background-color: #fee2e2;
+  color: #b91c1c;
 }
 
 .youtube-tool__table {
@@ -105,15 +73,6 @@
 }
 
 @media (max-width: 768px) {
-  .youtube-tool__input-group {
-    flex-direction: column;
-  }
-
-  .youtube-tool__input-group button {
-    width: 100%;
-    padding: 0.75rem;
-  }
-
   .youtube-tool__table th,
   .youtube-tool__table td {
     padding: 0.5rem;
