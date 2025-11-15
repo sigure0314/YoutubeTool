@@ -5,7 +5,6 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Options;
 using YoutubeTool.Api.Data;
 using YoutubeTool.Api.Dtos;
@@ -21,7 +20,7 @@ public class YoutubeCommentService : IYoutubeCommentService
     private readonly HttpClient _httpClient;
     private readonly YoutubeApiOptions _options;
     private readonly ILogger<YoutubeCommentService> _logger;
-    private readonly ApplicationDbContext _dbContext;
+    private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
     private static readonly SemaphoreSlim InitializationSemaphore = new(1, 1);
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> VideoLocks = new(StringComparer.OrdinalIgnoreCase);
     private static bool _isDatabaseInitialized;
@@ -30,12 +29,12 @@ public class YoutubeCommentService : IYoutubeCommentService
         HttpClient httpClient,
         IOptions<YoutubeApiOptions> options,
         ILogger<YoutubeCommentService> logger,
-        ApplicationDbContext dbContext)
+        IDbContextFactory<ApplicationDbContext> dbContextFactory)
     {
         _httpClient = httpClient;
         _options = options.Value;
         _logger = logger;
-        _dbContext = dbContext;
+        _dbContextFactory = dbContextFactory;
     }
 
     public async Task<YoutubeCommentsResponse> GetTopLevelCommentsAsync(string videoId, int page, CancellationToken cancellationToken = default)
@@ -101,7 +100,9 @@ public class YoutubeCommentService : IYoutubeCommentService
         var uniqueCount = 0;
         var hasMore = false;
 
-        await foreach (var comment in _dbContext.YoutubeComments
+        await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+
+        await foreach (var comment in context.YoutubeComments
             .AsNoTracking()
             .Where(c => c.VideoId == videoId)
             .OrderByDescending(c => c.PublishedAt)
@@ -154,8 +155,9 @@ public class YoutubeCommentService : IYoutubeCommentService
                 return;
             }
 
-            await _dbContext.Database.MigrateAsync(cancellationToken);
-            _isDatabaseInitialized = true;
+            await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+            await context.Database.MigrateAsync(cancellationToken);
+            Volatile.Write(ref _isDatabaseInitialized, true);
         }
         finally
         {
@@ -167,11 +169,13 @@ public class YoutubeCommentService : IYoutubeCommentService
     {
         try
         {
-            var tableName = _dbContext.Model
+            await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+
+            var tableName = context.Model
                 .FindEntityType(typeof(YoutubeComment))?
                 .GetTableName() ?? "YoutubeComments";
 
-            var connectionString = _dbContext.Database.GetConnectionString();
+            var connectionString = context.Database.GetConnectionString();
 
             if (string.IsNullOrWhiteSpace(connectionString))
             {
@@ -203,20 +207,21 @@ public class YoutubeCommentService : IYoutubeCommentService
 
         try
         {
+            var uniqueComments = DeduplicateComments(comments);
+
             await ExecuteWithRetryAsync(async retryCancellationToken =>
             {
-                await using var transaction = await _dbContext.Database.BeginTransactionAsync(retryCancellationToken);
+                await using var context = await _dbContextFactory.CreateDbContextAsync(retryCancellationToken);
+                await using var transaction = await context.Database.BeginTransactionAsync(retryCancellationToken);
 
-                await _dbContext.YoutubeComments
+                await context.YoutubeComments
                     .Where(c => c.VideoId == videoId)
                     .ExecuteDeleteAsync(retryCancellationToken);
 
-                var uniqueComments = DeduplicateComments(comments);
-
                 if (uniqueComments.Count > 0)
                 {
-                    await _dbContext.YoutubeComments.AddRangeAsync(uniqueComments, retryCancellationToken);
-                    await _dbContext.SaveChangesAsync(retryCancellationToken);
+                    await context.YoutubeComments.AddRangeAsync(uniqueComments, retryCancellationToken);
+                    await context.SaveChangesAsync(retryCancellationToken);
                 }
 
                 await transaction.CommitAsync(retryCancellationToken);
@@ -286,14 +291,12 @@ public class YoutubeCommentService : IYoutubeCommentService
             {
                 lastException = ex;
                 _logger.LogWarning(ex, "Transient SQLite error while persisting comments. Retrying...");
-                _dbContext.ChangeTracker.Clear();
             }
             catch (SqliteException ex) when (IsMissingTableException(ex))
             {
                 lastException = ex;
                 _logger.LogWarning(ex, "Missing database table detected while persisting comments. Attempting to re-apply migrations.");
 
-                _dbContext.ChangeTracker.Clear();
                 Volatile.Write(ref _isDatabaseInitialized, false);
 
                 await EnsureDatabaseReadyAsync(cancellationToken);
