@@ -21,20 +21,21 @@ public class YoutubeCommentService : IYoutubeCommentService
     private readonly YoutubeApiOptions _options;
     private readonly ILogger<YoutubeCommentService> _logger;
     private readonly IDbContextFactory<ApplicationDbContext> _dbContextFactory;
-    private static readonly SemaphoreSlim InitializationSemaphore = new(1, 1);
+    private readonly IDatabaseInitializer _databaseInitializer;
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> VideoLocks = new(StringComparer.OrdinalIgnoreCase);
-    private static bool _isDatabaseInitialized;
 
     public YoutubeCommentService(
         HttpClient httpClient,
         IOptions<YoutubeApiOptions> options,
         ILogger<YoutubeCommentService> logger,
-        IDbContextFactory<ApplicationDbContext> dbContextFactory)
+        IDbContextFactory<ApplicationDbContext> dbContextFactory,
+        IDatabaseInitializer databaseInitializer)
     {
         _httpClient = httpClient;
         _options = options.Value;
         _logger = logger;
         _dbContextFactory = dbContextFactory;
+        _databaseInitializer = databaseInitializer;
     }
 
     public async Task<YoutubeCommentsResponse> GetTopLevelCommentsAsync(string videoId, int page, CancellationToken cancellationToken = default)
@@ -63,7 +64,7 @@ public class YoutubeCommentService : IYoutubeCommentService
         {
             _logger.LogWarning(ex, "Database schema is missing. Re-applying migrations and retrying the request.");
 
-            Volatile.Write(ref _isDatabaseInitialized, false);
+            _databaseInitializer.Reset();
             await EnsureDatabaseReadyAsync(cancellationToken);
 
             return await BuildResponseAsync(videoId, normalizedPage, comments, cancellationToken);
@@ -141,63 +142,7 @@ public class YoutubeCommentService : IYoutubeCommentService
 
     private async Task EnsureDatabaseReadyAsync(CancellationToken cancellationToken)
     {
-        if (_isDatabaseInitialized && await IsSchemaReadyAsync(cancellationToken))
-        {
-            return;
-        }
-
-        await InitializationSemaphore.WaitAsync(cancellationToken);
-
-        try
-        {
-            if (_isDatabaseInitialized && await IsSchemaReadyAsync(cancellationToken))
-            {
-                return;
-            }
-
-            await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
-            await context.Database.MigrateAsync(cancellationToken);
-            Volatile.Write(ref _isDatabaseInitialized, true);
-        }
-        finally
-        {
-            InitializationSemaphore.Release();
-        }
-    }
-
-    private async Task<bool> IsSchemaReadyAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            await using var context = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
-
-            var tableName = context.Model
-                .FindEntityType(typeof(YoutubeComment))?
-                .GetTableName() ?? "YoutubeComments";
-
-            var connectionString = context.Database.GetConnectionString();
-
-            if (string.IsNullOrWhiteSpace(connectionString))
-            {
-                return false;
-            }
-
-            await using var connection = new SqliteConnection(connectionString);
-            await connection.OpenAsync(cancellationToken);
-
-            await using var command = connection.CreateCommand();
-            command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $table LIMIT 1;";
-            command.Parameters.AddWithValue("$table", tableName);
-
-            var result = await command.ExecuteScalarAsync(cancellationToken);
-
-            return result is not null;
-        }
-        catch (SqliteException ex)
-        {
-            _logger.LogWarning(ex, "Failed to verify database schema state.");
-            return false;
-        }
+        await _databaseInitializer.EnsureCreatedAsync(cancellationToken);
     }
 
     private async Task PersistCommentsAsync(string videoId, List<YoutubeComment> comments, CancellationToken cancellationToken)
@@ -297,7 +242,7 @@ public class YoutubeCommentService : IYoutubeCommentService
                 lastException = ex;
                 _logger.LogWarning(ex, "Missing database table detected while persisting comments. Attempting to re-apply migrations.");
 
-                Volatile.Write(ref _isDatabaseInitialized, false);
+                _databaseInitializer.Reset();
 
                 await EnsureDatabaseReadyAsync(cancellationToken);
             }

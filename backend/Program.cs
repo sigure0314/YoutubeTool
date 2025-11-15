@@ -21,6 +21,8 @@ if (string.IsNullOrWhiteSpace(connectionString))
 builder.Services.AddDbContextFactory<ApplicationDbContext>(options =>
     options.UseSqlite(connectionString));
 
+builder.Services.AddSingleton<IDatabaseInitializer, DatabaseInitializer>();
+
 builder.Services.Configure<YoutubeApiOptions>(builder.Configuration.GetSection("YoutubeApi"));
 
 builder.Services.AddHttpClient<IYoutubeCommentService, YoutubeCommentService>((sp, client) =>
@@ -63,9 +65,8 @@ var app = builder.Build();
 
 await using (var scope = app.Services.CreateAsyncScope())
 {
-    var factory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<ApplicationDbContext>>();
-    await using var db = await factory.CreateDbContextAsync();
-    await db.Database.MigrateAsync();
+    var initializer = scope.ServiceProvider.GetRequiredService<IDatabaseInitializer>();
+    await initializer.EnsureCreatedAsync();
 }
 
 if (app.Environment.IsDevelopment())
