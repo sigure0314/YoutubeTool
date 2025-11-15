@@ -55,14 +55,35 @@ public class YoutubeCommentService : IYoutubeCommentService
         var normalizedPage = Math.Max(1, page);
 
         var comments = await FetchAllCommentsFromApiAsync(videoId, cancellationToken);
-        await PersistCommentsAsync(videoId, comments, cancellationToken);
 
-        var (pageComments, hasMore) = await LoadPageFromDatabaseAsync(videoId, normalizedPage, cancellationToken);
+        try
+        {
+            return await BuildResponseAsync(videoId, normalizedPage, comments, cancellationToken);
+        }
+        catch (SqliteException ex) when (IsMissingTableException(ex))
+        {
+            _logger.LogWarning(ex, "Database schema is missing. Re-applying migrations and retrying the request.");
+
+            Volatile.Write(ref _isDatabaseInitialized, false);
+            await EnsureDatabaseReadyAsync(cancellationToken);
+
+            return await BuildResponseAsync(videoId, normalizedPage, comments, cancellationToken);
+        }
+    }
+
+    private async Task<YoutubeCommentsResponse> BuildResponseAsync(
+        string videoId,
+        int page,
+        List<YoutubeComment> comments,
+        CancellationToken cancellationToken)
+    {
+        await PersistCommentsAsync(videoId, comments, cancellationToken);
+        var (pageComments, hasMore) = await LoadPageFromDatabaseAsync(videoId, page, cancellationToken);
 
         return new YoutubeCommentsResponse
         {
             VideoId = videoId,
-            Page = normalizedPage,
+            Page = page,
             PageSize = PageSize,
             HasMore = hasMore,
             Comments = pageComments
@@ -247,6 +268,12 @@ public class YoutubeCommentService : IYoutubeCommentService
     private static bool IsTransientSqliteException(SqliteException exception)
     {
         return exception.SqliteErrorCode is 5 or 6 or 262;
+    }
+
+    private static bool IsMissingTableException(SqliteException exception)
+    {
+        return exception.SqliteErrorCode == 1 &&
+               exception.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<List<YoutubeComment>> FetchAllCommentsFromApiAsync(string videoId, CancellationToken cancellationToken)
