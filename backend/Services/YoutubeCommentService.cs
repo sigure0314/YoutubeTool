@@ -288,6 +288,16 @@ public class YoutubeCommentService : IYoutubeCommentService
                 _logger.LogWarning(ex, "Transient SQLite error while persisting comments. Retrying...");
                 _dbContext.ChangeTracker.Clear();
             }
+            catch (SqliteException ex) when (IsMissingTableException(ex))
+            {
+                lastException = ex;
+                _logger.LogWarning(ex, "Missing database table detected while persisting comments. Attempting to re-apply migrations.");
+
+                _dbContext.ChangeTracker.Clear();
+                Volatile.Write(ref _isDatabaseInitialized, false);
+
+                await EnsureDatabaseReadyAsync(cancellationToken);
+            }
         }
 
         if (lastException is not null)
